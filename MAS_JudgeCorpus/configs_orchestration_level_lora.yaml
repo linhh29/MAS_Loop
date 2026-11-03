@@ -1,0 +1,43 @@
+model:
+  base_model: "/path/to/models/Skywork-Reward-V2-Qwen3-8B"
+  max_length: 4096
+  use_4bit: true
+  bf16: true
+  fp16: false
+
+data:
+  train_file: "/path/to/MAS_Loop/MAS_JudgeCorpus/data/hotpotqa_task25/orchestration_level_train_for_orchrm.jsonl"
+  val_file: "/path/to/MAS_Loop/MAS_JudgeCorpus/data/hotpotqa_task25/orchestration_level_val_for_orchrm.jsonl"
+  tokenized_dir: ""
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+output:
+  config_dir: "/path/to/checkpoints/reward_models/orchestration_level/configs"
+
+train:
+  rolling_dir: "/path/to/checkpoints/reward_models/hotpotqa_task25/orchestration_level/rolling"
+  checkpoint_dir: "/path/to/checkpoints/reward_models/hotpotqa_task25/orchestration_level/checkpoints"
+  final_dir: "/path/to/checkpoints/reward_models/hotpotqa_task25/orchestration_level/final"
+  num_train_epochs: 2
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
+  logging_steps: 10
+  eval_strategy: "steps"
+  eval_steps: 100
+  save_strategy: "steps"
+  save_steps: 100
+  save_total_limit: 3
+  gradient_checkpointing: true
+  seed: 42
+  report_to: "none"
+  run_name: "hotpotqa-task25-orchestration-lora"
+  resume_if_possible: true

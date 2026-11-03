@@ -1,0 +1,43 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+keys/
+
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Experiment outputs
+runs/
+outputs/
+checkpoints/
+logs/
+wandb/
+*.log
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Generated datasets and reports
+*.parquet
+*.jsonl
+*.jsonl.gz
+reports/
+analysis/

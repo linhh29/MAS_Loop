@@ -1,0 +1,4 @@
+# Installed into MAS_Loop/verl/.mas_loop_deps, never into the global environment.
+TransferQueue==0.1.8
+tensordict==0.10.0
+pyvers==0.1.0

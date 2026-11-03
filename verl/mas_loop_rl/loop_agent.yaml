@@ -1,0 +1,6 @@
+- name: mas_loop_orchestra
+  _target_: mas_loop_rl.loop_agent.MASLoopOrchestraAgentLoop
+- name: mas_loop_editor
+  _target_: mas_loop_rl.loop_agent.MASLoopEditorAgentLoop
+- name: mas_loop_editor_replay
+  _target_: mas_loop_rl.loop_agent.MASLoopEditorReplayAgentLoop

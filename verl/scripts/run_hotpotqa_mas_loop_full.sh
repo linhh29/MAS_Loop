@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=$(readlink -f "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)")
+PROFILE_DATASET=${HP_DATASET_NAME:-hotpotqa}
+TASK_JSON=${HP_TASK_JSON:-${ROOT}/datasets/BrowseComp-Plus/hotpotqa/data/hotpotqa_train.jsonl}
+[[ -f "${TASK_JSON}" ]] || { echo "[HP] missing training dataset: ${TASK_JSON}" >&2; exit 2; }
+read -r SOURCE_ROWS < <(wc -l < "${TASK_JSON}")
+[[ "${SOURCE_ROWS}" =~ ^[0-9]+$ && "${SOURCE_ROWS}" -gt 0 ]] || { echo "[HP] invalid row count for ${TASK_JSON}: ${SOURCE_ROWS}" >&2; exit 2; }
+TS=${HP_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
+GPU_DOMAIN=${HP_ALL_GPUS:-8,9,10,11,12,13,14,15}
+case "${GPU_DOMAIN}" in
+  0,1,2,3,4,5,6,7) DEFAULT_NAMESPACE=87; DOMAIN_TAG=gpu0-7; DEFAULT_CPUSET=0-47,96-143; DEFAULT_VLLM_PORT_BASE=41000; DEFAULT_EXTERNAL_TP=8; DEFAULT_EXTERNAL_DP=1 ;;
+  8,9,10,11,12,13,14,15) DEFAULT_NAMESPACE=88; DOMAIN_TAG=gpu8-15; DEFAULT_CPUSET=48-95,144-191; DEFAULT_VLLM_PORT_BASE=51000; DEFAULT_EXTERNAL_TP=8; DEFAULT_EXTERNAL_DP=1 ;;
+  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
+    [[ "${HP_ENABLE_16GPU_ABLATION:-0}" == "1" ]] || { echo "[HP] full 16-GPU domain requires HP_ENABLE_16GPU_ABLATION=1" >&2; exit 2; }
+    DEFAULT_NAMESPACE=89; DOMAIN_TAG=gpu0-15; DEFAULT_CPUSET=0-191; DEFAULT_VLLM_PORT_BASE=61000; DEFAULT_EXTERNAL_TP=8; DEFAULT_EXTERNAL_DP=2 ;;
+  *) echo "[HP] HP_ALL_GPUS must be exactly 0-7, 8-15, or opt-in 0-15, got ${GPU_DOMAIN}" >&2; exit 2 ;;
+esac
+PORT_NAMESPACE=${HP_PORT_NAMESPACE:-${DEFAULT_NAMESPACE}}
+GPU_COUNT=$(awk -F, '{print NF}' <<< "${GPU_DOMAIN}")
+# Keep both 8-GPU domains isolated even when they start in the same second.
+RUN_ROOT=${HP_RUN_ROOT:-/path/to/checkpoints/${PROFILE_DATASET}/${TS}/${DOMAIN_TAG}}
+HP_REFINER_LR=${HP_REFINER_LR:-${HP_EDITOR_LR:-1e-6}}
+HP_ORCH_LR=${HP_ORCH_LR:-5e-7}
+HP_JUDGE_MODEL=${HP_JUDGE_MODEL:-${HP_SUBAGENT_MODEL:-/path/to/models/Qwen3-30B-A3B}}
+REQUESTED_TRAIN_ROWS=${HP_MAX_TRAIN_ROWS:-0}
+[[ "${REQUESTED_TRAIN_ROWS}" =~ ^[0-9]+$ ]] || { echo "[HP] HP_MAX_TRAIN_ROWS must be a non-negative integer" >&2; exit 2; }
+if (( REQUESTED_TRAIN_ROWS == 0 )); then
+  TRAIN_ROWS=${SOURCE_ROWS}
+else
+  (( REQUESTED_TRAIN_ROWS <= SOURCE_ROWS )) || { echo "[HP] requested ${REQUESTED_TRAIN_ROWS} rows, dataset has ${SOURCE_ROWS}" >&2; exit 2; }
+  TRAIN_ROWS=${REQUESTED_TRAIN_ROWS}
+fi
+# Fixed HotpotQA full-run contract. Do not inherit stale values exported by an
+# older parent shell. The default remains the historical two-role/16-rollout
+# run; the explicitly named pure-orchestrator ablation is isolated below.
+TRAIN_BATCH=256
+PURE_ORCHESTRATOR_ABLATION=${HP_PURE_ORCHESTRATOR_ABLATION:-0}
+[[ "${PURE_ORCHESTRATOR_ABLATION}" == "0" || "${PURE_ORCHESTRATOR_ABLATION}" == "1" ]] || { echo "[HP] HP_PURE_ORCHESTRATOR_ABLATION must be 0 or 1" >&2; exit 2; }
+if [[ "${PURE_ORCHESTRATOR_ABLATION}" == "1" ]]; then
+  ROLLOUT_N=32
+  RUN_EDITOR_OVERRIDE=0
+else
+  ROLLOUT_N=16
+  RUN_EDITOR_OVERRIDE=1
+fi
+# Fixed HotpotQA generation contract. These are vLLM max-output-token values,
+# not tuning knobs; ignore stale parent-shell overrides and pass the fixed
+# values explicitly to the downstream launcher.
+for token_spec in \
+  HP_MAX_AGENT_TOKENS:8192 \
+  HP_EDITOR_MAX_TOKENS:8192 \
+  HP_JUDGE_MAX_TOKENS:4096; do
+  token_name=${token_spec%%:*}
+  fixed_value=${token_spec#*:}
+  supplied_value=${!token_name:-}
+  if [[ -n "${supplied_value}" && "${supplied_value}" != "${fixed_value}" ]]; then
+    echo "[HP] ignoring stale ${token_name}=${supplied_value}; fixed value is ${fixed_value}" >&2
+  fi
+done
+if [[ -n "${HP_TRAIN_BATCH_SIZE:-}" && "${HP_TRAIN_BATCH_SIZE}" != "${TRAIN_BATCH}" ]]; then
+  echo "[HP] ignoring stale HP_TRAIN_BATCH_SIZE=${HP_TRAIN_BATCH_SIZE}; fixed value is ${TRAIN_BATCH}" >&2
+fi
+if [[ -n "${HP_ROLLOUT_N:-}" && "${HP_ROLLOUT_N}" != "${ROLLOUT_N}" ]]; then
+  echo "[HP] ignoring stale HP_ROLLOUT_N=${HP_ROLLOUT_N}; fixed value is ${ROLLOUT_N}" >&2
+fi
+# The seed=0 subset contains 10,000 tasks, so 256 tasks/step gives 40
+# joint steps after padding. rollout_n=16 yields 4,096 rollout/refiner rows per step.
+EDITOR_BATCH=$((TRAIN_BATCH * ROLLOUT_N))
+if [[ -n "${HP_REFINER_TRAIN_BATCH_SIZE:-}" && "${HP_REFINER_TRAIN_BATCH_SIZE}" != "${EDITOR_BATCH}" ]]; then
+  echo "[HP] ignoring stale HP_REFINER_TRAIN_BATCH_SIZE=${HP_REFINER_TRAIN_BATCH_SIZE}; fixed value is ${EDITOR_BATCH}" >&2
+fi
+if [[ -n "${HP_EDITOR_TRAIN_BATCH_SIZE:-}" && "${HP_EDITOR_TRAIN_BATCH_SIZE}" != "${EDITOR_BATCH}" ]]; then
+  echo "[HP] ignoring stale HP_EDITOR_TRAIN_BATCH_SIZE=${HP_EDITOR_TRAIN_BATCH_SIZE}; fixed value is ${EDITOR_BATCH}" >&2
+fi
+EXPECTED_STEPS=$(((TRAIN_ROWS + TRAIN_BATCH - 1) / TRAIN_BATCH))
+DATA_PAD_TO_MULTIPLE=${HP_DATA_PAD_TO_MULTIPLE:-${TRAIN_BATCH}}
+[[ "${DATA_PAD_TO_MULTIPLE}" =~ ^[0-9]+$ ]] || { echo "[HP] HP_DATA_PAD_TO_MULTIPLE must be a non-negative integer" >&2; exit 2; }
+PREPARE_DATA_SHUFFLE=${HP_PREPARE_DATA_SHUFFLE:-True}
+TRAIN_DATA_SHUFFLE=${HP_TRAIN_DATA_SHUFFLE:-True}
+TRAIN_DROP_LAST=${HP_TRAIN_DROP_LAST:-True}
+PAD_EDITOR_REPLAY_TO_EXPECTED_ROWS=${HP_PAD_EDITOR_REPLAY_TO_EXPECTED_ROWS:-True}
+for bool_name in PREPARE_DATA_SHUFFLE TRAIN_DATA_SHUFFLE TRAIN_DROP_LAST PAD_EDITOR_REPLAY_TO_EXPECTED_ROWS; do
+  bool_value=${!bool_name}
+  [[ "${bool_value}" == "True" || "${bool_value}" == "False" ]] || { echo "[HP] ${bool_name} must be True or False" >&2; exit 2; }
+done
+if [[ "${TRAIN_DROP_LAST}" == "True" ]]; then
+  EXPECTED_STEPS=$((TRAIN_ROWS / TRAIN_BATCH))
+else
+  EXPECTED_STEPS=$(((TRAIN_ROWS + TRAIN_BATCH - 1) / TRAIN_BATCH))
+fi
+(( EXPECTED_STEPS > 0 )) || { echo "[HP] no training steps for rows=${TRAIN_ROWS} batch=${TRAIN_BATCH} drop_last=${TRAIN_DROP_LAST}" >&2; exit 2; }
+if (( DATA_PAD_TO_MULTIPLE > 0 )); then
+  PADDED_ROWS=$((((TRAIN_ROWS + DATA_PAD_TO_MULTIPLE - 1) / DATA_PAD_TO_MULTIPLE) * DATA_PAD_TO_MULTIPLE))
+else
+  PADDED_ROWS=${TRAIN_ROWS}
+fi
+NUM_CHECKPOINTS=${HP_NUM_CHECKPOINTS:-11}
+ORCHESTRA_PORT=${HP_ORCHESTRA_PORT:-${PORT_NAMESPACE}10}
+EDITOR_PORT=${HP_EDITOR_PORT:-${PORT_NAMESPACE}11}
+SUBAGENT_PORT=${HP_SUBAGENT_PORT:-${PORT_NAMESPACE}12}
+HP_SHARE_SUBAGENT_JUDGE_VLLM=${HP_SHARE_SUBAGENT_JUDGE_VLLM:-1}
+HP_MAX_JOINT_STEPS_THIS_RUN=${HP_MAX_JOINT_STEPS_THIS_RUN:-0}
+[[ "${HP_SHARE_SUBAGENT_JUDGE_VLLM}" == "0" || "${HP_SHARE_SUBAGENT_JUDGE_VLLM}" == "1" ]] || { echo "[HP] HP_SHARE_SUBAGENT_JUDGE_VLLM must be 0 or 1" >&2; exit 2; }
+if [[ "${HP_SHARE_SUBAGENT_JUDGE_VLLM}" == "1" ]]; then
+  JUDGE_PORT=${HP_JUDGE_PORT:-${SUBAGENT_PORT}}
+else
+  JUDGE_PORT=${HP_JUDGE_PORT:-${PORT_NAMESPACE}13}
+fi
+RAY_DASHBOARD_PORT=${HP_RAY_DASHBOARD_PORT:-${PORT_NAMESPACE}25}
+# Validate every externally supplied port before starting Ray/vLLM.  A namespace
+# such as 989 would otherwise concatenate into invalid ports (98910, ...),
+# delaying the real startup failure and obscuring CUDA/vLLM diagnostics.
+for port_name in ORCHESTRA_PORT EDITOR_PORT SUBAGENT_PORT JUDGE_PORT RAY_DASHBOARD_PORT; do
+  port_value=${!port_name}
+  [[ "${port_value}" =~ ^[0-9]+$ ]] && (( port_value >= 1 && port_value <= 65535 )) || {
+    echo "[HP] ${port_name} must be an integer TCP port in [1,65535], got ${port_value}" >&2
+    exit 2
+  }
+done
+RAY_TEMP_DIR=${HP_RAY_TEMP_DIR:-/tmp/mas_loop_${PROFILE_DATASET}_ray_${TS}_${PORT_NAMESPACE}}
+CONTROL_DIR=${HP_CONTROL_DIR:-/tmp/mas_loop_${PROFILE_DATASET}_control_${TS}_${PORT_NAMESPACE}}
+# Eight-GPU runs keep one TP=8 replica. Explicit 16-GPU ablations use two
+# TP=8 replicas; normal experiment topology remains unchanged.
+HP_PEER_TENSOR_PARALLEL_SIZE=${HP_PEER_TENSOR_PARALLEL_SIZE:-${DEFAULT_EXTERNAL_TP}}
+HP_PEER_DATA_PARALLEL_SIZE=${HP_PEER_DATA_PARALLEL_SIZE:-${DEFAULT_EXTERNAL_DP}}
+HP_SUBAGENT_TENSOR_PARALLEL_SIZE=${HP_SUBAGENT_TENSOR_PARALLEL_SIZE:-${DEFAULT_EXTERNAL_TP}}
+HP_SUBAGENT_DATA_PARALLEL_SIZE=${HP_SUBAGENT_DATA_PARALLEL_SIZE:-${DEFAULT_EXTERNAL_DP}}
+HP_JUDGE_TENSOR_PARALLEL_SIZE=${HP_JUDGE_TENSOR_PARALLEL_SIZE:-${DEFAULT_EXTERNAL_TP}}
+HP_JUDGE_DATA_PARALLEL_SIZE=${HP_JUDGE_DATA_PARALLEL_SIZE:-${DEFAULT_EXTERNAL_DP}}
+for topology in \
+  "editor-peer:${HP_PEER_TENSOR_PARALLEL_SIZE}:${HP_PEER_DATA_PARALLEL_SIZE}" \
+  "subagent:${HP_SUBAGENT_TENSOR_PARALLEL_SIZE}:${HP_SUBAGENT_DATA_PARALLEL_SIZE}" \
+  "judge:${HP_JUDGE_TENSOR_PARALLEL_SIZE}:${HP_JUDGE_DATA_PARALLEL_SIZE}"; do
+  IFS=: read -r role tp dp <<< "${topology}"
+  [[ "${tp}" =~ ^[1-9][0-9]*$ && "${dp}" =~ ^[1-9][0-9]*$ ]] || { echo "[HP] ${role} TP/DP must be positive integers" >&2; exit 2; }
+  (( tp == 8 && tp * dp == GPU_COUNT )) || { echo "[HP] ${role} must use TP=8 and cover all selected GPUs, got TP=${tp} DP=${dp}" >&2; exit 2; }
+done
+HP_AGENT_LOOP_WORKER_PROCESSES=${HP_AGENT_LOOP_WORKER_PROCESSES:-16}
+HP_AGENT_LOOP_MAX_OUTSTANDING_PER_WORKER=${HP_AGENT_LOOP_MAX_OUTSTANDING_PER_WORKER:-128}
+# This is a separate global Ray generate-RPC admission gate. Keep it at least
+# as large as Editor vLLM admission; otherwise vLLM=1024 is only nominal.
+HP_RAY_GENERATE_MAX_OUTSTANDING=${HP_RAY_GENERATE_MAX_OUTSTANDING:-2048}
+HP_DISPATCH_WORKERS_PER_PROCESS=${HP_DISPATCH_WORKERS_PER_PROCESS:-256}
+HP_DAG_AGENT_WORKERS_PER_PROCESS=${HP_DAG_AGENT_WORKERS_PER_PROCESS:-128}
+HP_VLLM_STARTUP_ATTEMPTS=${HP_VLLM_STARTUP_ATTEMPTS:-720}
+HP_PHASE_LEASE_GRACE_SEC=${HP_PHASE_LEASE_GRACE_SEC:-3.0}
+HP_VLLM_DP_QUIESCE_SEC=${HP_VLLM_DP_QUIESCE_SEC:-3.0}
+HP_EXTERNAL_VLLM_CPU_THREADS=${HP_EXTERNAL_VLLM_CPU_THREADS:-4}
+HP_RAY_WORKER_CPU_THREADS=${HP_RAY_WORKER_CPU_THREADS:-1}
+HP_EXTERNAL_VLLM_CPUSET=${HP_EXTERNAL_VLLM_CPUSET:-${DEFAULT_CPUSET}}
+HP_EXTERNAL_VLLM_PORT_BASE=${HP_EXTERNAL_VLLM_PORT_BASE:-${DEFAULT_VLLM_PORT_BASE}}
+# Editor is an 8B TP8/DP1 service. Keep admission limits independent from
+# tensor/data parallel topology so concurrency tuning cannot silently change
+# how the model is loaded. These are independent requests: no cache,
+# deduplication, or result reuse is involved. Admission values remain
+# overrideable for 512/1024/2048 A/B runs.
+HP_REFINER_VLLM_MAX_ACTIVE=${HP_REFINER_VLLM_MAX_ACTIVE:-1024}
+HP_REFINER_MAX_NUM_SEQS=${HP_REFINER_MAX_NUM_SEQS:-1024}
+# vLLM 0.10.0 V1 rejects concurrent partial prefill during engine creation, so
+# both values must stay at 1 on this V1-only MAS-Loop launcher. Throughput is
+# increased with DP replicas, scheduler sequences, and batched-token capacity
+# instead of an unsupported prefill mode; model max-output-token contracts are
+# unchanged.
+HP_REFINER_MAX_BATCHED_TOKENS=${HP_REFINER_MAX_BATCHED_TOKENS:-196608}
+HP_REFINER_MAX_NUM_PARTIAL_PREFILLS=${HP_REFINER_MAX_NUM_PARTIAL_PREFILLS:-1}
+HP_REFINER_MAX_LONG_PARTIAL_PREFILLS=${HP_REFINER_MAX_LONG_PARTIAL_PREFILLS:-1}
+HP_REFINER_CANDIDATE_CONCURRENCY=${HP_REFINER_CANDIDATE_CONCURRENCY:-1}
+HP_REFINER_HTTP_POOL_MAXSIZE=${HP_REFINER_HTTP_POOL_MAXSIZE:-1024}
+HP_USE_DYNAMIC_BSZ=${HP_USE_DYNAMIC_BSZ:-True}
+HP_PPO_MAX_TOKEN_LEN_PER_GPU=${HP_PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
+HP_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${HP_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${HP_PPO_MAX_TOKEN_LEN_PER_GPU}}
+# Role-specific Editor overrides keep PPO capacity A/B tests isolated from the
+# Orchestra optimizer. Defaults preserve the historical shared-cap behavior.
+HP_EDITOR_PPO_MAX_TOKEN_LEN_PER_GPU=${HP_EDITOR_PPO_MAX_TOKEN_LEN_PER_GPU:-${HP_PPO_MAX_TOKEN_LEN_PER_GPU}}
+HP_EDITOR_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${HP_EDITOR_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${HP_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}}
+HP_ACTOR_PARAM_OFFLOAD=${HP_ACTOR_PARAM_OFFLOAD:-${ACTOR_PARAM_OFFLOAD:-True}}
+HP_ACTOR_OPTIMIZER_OFFLOAD=${HP_ACTOR_OPTIMIZER_OFFLOAD:-${ACTOR_OPTIMIZER_OFFLOAD:-True}}
+HP_REF_PARAM_OFFLOAD=${HP_REF_PARAM_OFFLOAD:-${REF_PARAM_OFFLOAD:-True}}
+HP_EDITOR_ACTOR_PARAM_OFFLOAD=${HP_EDITOR_ACTOR_PARAM_OFFLOAD:-${HP_ACTOR_PARAM_OFFLOAD}}
+HP_EDITOR_ACTOR_OPTIMIZER_OFFLOAD=${HP_EDITOR_ACTOR_OPTIMIZER_OFFLOAD:-${HP_ACTOR_OPTIMIZER_OFFLOAD}}
+HP_EDITOR_REF_PARAM_OFFLOAD=${HP_EDITOR_REF_PARAM_OFFLOAD:-${HP_REF_PARAM_OFFLOAD}}
+[[ "${HP_AGENT_LOOP_WORKER_PROCESSES}" =~ ^[1-9][0-9]*$ && "${HP_AGENT_LOOP_MAX_OUTSTANDING_PER_WORKER}" =~ ^[1-9][0-9]*$ && "${HP_RAY_GENERATE_MAX_OUTSTANDING}" =~ ^[1-9][0-9]*$ && "${HP_DISPATCH_WORKERS_PER_PROCESS}" =~ ^[1-9][0-9]*$ ]] || { echo "[HP] AgentLoop/Ray/dispatch limits must be positive integers" >&2; exit 2; }
+[[ "${HP_DAG_AGENT_WORKERS_PER_PROCESS}" =~ ^[1-9][0-9]*$ ]] || { echo "[HP] HP_DAG_AGENT_WORKERS_PER_PROCESS must be a positive integer" >&2; exit 2; }
+[[ "${HP_RAY_WORKER_CPU_THREADS}" =~ ^[1-9][0-9]*$ ]] || { echo "[HP] HP_RAY_WORKER_CPU_THREADS must be a positive integer" >&2; exit 2; }
+[[ "${HP_VLLM_STARTUP_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] || { echo "[HP] HP_VLLM_STARTUP_ATTEMPTS must be a positive integer" >&2; exit 2; }
+for value_name in HP_REFINER_VLLM_MAX_ACTIVE HP_REFINER_MAX_NUM_SEQS HP_REFINER_MAX_BATCHED_TOKENS HP_REFINER_MAX_NUM_PARTIAL_PREFILLS HP_REFINER_MAX_LONG_PARTIAL_PREFILLS HP_REFINER_CANDIDATE_CONCURRENCY HP_REFINER_HTTP_POOL_MAXSIZE; do
+  value=${!value_name}
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]] || { echo "[HP] ${value_name} must be a positive integer, got ${value}" >&2; exit 2; }
+done
+[[ "${HP_USE_DYNAMIC_BSZ}" == "True" || "${HP_USE_DYNAMIC_BSZ}" == "False" ]] || { echo "[HP] HP_USE_DYNAMIC_BSZ must be True or False" >&2; exit 2; }
+# Fail closed before Ray/vLLM startup when the vendor accelerator health probe
+# is unavailable. PPU deployments may not expose standard ROCm /dev/kfd nodes.
+# Keep HP_CONFIG_ONLY usable on CPU so topology/configuration tests remain runnable.
+if [[ "${HP_CONFIG_ONLY:-0}" != "1" ]]; then
+  if ! command -v ppu-smi >/dev/null 2>&1 || \
+     ! timeout --kill-after=2s 15s ppu-smi >/dev/null 2>&1; then
+    echo "[HP] PPU driver/device is unavailable; refusing to start the GPU training run." >&2
+    exit 69
+  fi
+fi
+for value_name in HP_ACTOR_PARAM_OFFLOAD HP_ACTOR_OPTIMIZER_OFFLOAD HP_REF_PARAM_OFFLOAD HP_EDITOR_ACTOR_PARAM_OFFLOAD HP_EDITOR_ACTOR_OPTIMIZER_OFFLOAD HP_EDITOR_REF_PARAM_OFFLOAD; do
+  value=${!value_name}
+  [[ "${value}" == "True" || "${value}" == "False" ]] || { echo "[HP] ${value_name} must be True or False, got ${value}" >&2; exit 2; }
+done
+for value_name in HP_PPO_MAX_TOKEN_LEN_PER_GPU HP_LOG_PROB_MAX_TOKEN_LEN_PER_GPU HP_EDITOR_PPO_MAX_TOKEN_LEN_PER_GPU HP_EDITOR_LOG_PROB_MAX_TOKEN_LEN_PER_GPU; do
+  value=${!value_name}
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]] || { echo "[HP] ${value_name} must be a positive integer, got ${value}" >&2; exit 2; }
+done
+EDITOR_RESIDENT_CAP=$((HP_AGENT_LOOP_WORKER_PROCESSES * HP_AGENT_LOOP_MAX_OUTSTANDING_PER_WORKER))
+EDITOR_DISPATCH_CAP=$((HP_AGENT_LOOP_WORKER_PROCESSES * HP_DISPATCH_WORKERS_PER_PROCESS))
+EDITOR_RAY_CAP=${HP_RAY_GENERATE_MAX_OUTSTANDING}
+EDITOR_SCHEDULER_CAP=$((HP_PEER_DATA_PARALLEL_SIZE * HP_REFINER_MAX_NUM_SEQS))
+EDITOR_HTTP_CAP=$((HP_AGENT_LOOP_WORKER_PROCESSES * HP_REFINER_HTTP_POOL_MAXSIZE))
+(( HP_REFINER_MAX_LONG_PARTIAL_PREFILLS <= HP_REFINER_MAX_NUM_PARTIAL_PREFILLS )) || {
+  echo "[HP] HP_REFINER_MAX_LONG_PARTIAL_PREFILLS must not exceed HP_REFINER_MAX_NUM_PARTIAL_PREFILLS" >&2; exit 2
+}
+if (( HP_REFINER_MAX_NUM_PARTIAL_PREFILLS != 1 || HP_REFINER_MAX_LONG_PARTIAL_PREFILLS != 1 )); then
+  echo "[HP] vLLM 0.10.0 V1 does not support concurrent partial prefill; Editor values must be 1/1" >&2
+  exit 2
+fi
+# Fail before allocating GPUs if any pre-vLLM layer would silently make the
+# requested Editor admission unreachable. This is concurrency overlap only;
+# every request still performs an independent model generation.
+for cap_spec in "resident:${EDITOR_RESIDENT_CAP}" "ray_generate:${EDITOR_RAY_CAP}" "dispatch:${EDITOR_DISPATCH_CAP}" "scheduler:${EDITOR_SCHEDULER_CAP}" "http:${EDITOR_HTTP_CAP}"; do
+  IFS=: read -r cap_name cap_value <<< "${cap_spec}"
+  (( HP_REFINER_VLLM_MAX_ACTIVE <= cap_value )) || {
+    echo "[HP] Editor admission=${HP_REFINER_VLLM_MAX_ACTIVE} exceeds ${cap_name} capacity=${cap_value}" >&2; exit 2
+  }
+done
+printf '[HP] mode=%s (pure_orchestrator=1 means no refiner; default=two-role)\n' "${PURE_ORCHESTRATOR_ABLATION}"
+printf '[HP] dataset=%s source_rows=%s train_rows=%s padded_rows=%s batch=%s rollout_n=%s expected_steps=%s\n' "${PROFILE_DATASET}" "${SOURCE_ROWS}" "${TRAIN_ROWS}" "${PADDED_ROWS}" "${TRAIN_BATCH}" "${ROLLOUT_N}" "${EXPECTED_STEPS}"
+printf '[HP] data prepare_shuffle=%s dataloader_shuffle=%s drop_last=%s pad_multiple=%s editor_exact_padding=%s\n' "${PREPARE_DATA_SHUFFLE}" "${TRAIN_DATA_SHUFFLE}" "${TRAIN_DROP_LAST}" "${DATA_PAD_TO_MULTIPLE}" "${PAD_EDITOR_REPLAY_TO_EXPECTED_ROWS}"
+printf '[HP] gpus=%s orchestra_lr=%s refiner_lr=%s checkpoints=%s\n' "${GPU_DOMAIN}" "${HP_ORCH_LR}" "${HP_REFINER_LR}" "${NUM_CHECKPOINTS}"
+printf '[HP] run_root=%s ports=%s/%s/%s/%s ray=%s control=%s\n' "${RUN_ROOT}" "${ORCHESTRA_PORT}" "${EDITOR_PORT}" "${SUBAGENT_PORT}" "${JUDGE_PORT}" "${RAY_TEMP_DIR}" "${CONTROL_DIR}"
+printf '[HP] external topology editor=%sx%s subagent=%sx%s judge=%sx%s (TPxDP)\n' "${HP_PEER_TENSOR_PARALLEL_SIZE}" "${HP_PEER_DATA_PARALLEL_SIZE}" "${HP_SUBAGENT_TENSOR_PARALLEL_SIZE}" "${HP_SUBAGENT_DATA_PARALLEL_SIZE}" "${HP_JUDGE_TENSOR_PARALLEL_SIZE}" "${HP_JUDGE_DATA_PARALLEL_SIZE}"
+printf '[HP] resident trajectory ceiling=%s (%s workers x %s)\n' "${EDITOR_RESIDENT_CAP}" "${HP_AGENT_LOOP_WORKER_PROCESSES}" "${HP_AGENT_LOOP_MAX_OUTSTANDING_PER_WORKER}"
+printf '[HP] editor effective caps admission=%s resident=%s ray_generate=%s dispatch=%s scheduler=%s http=%s\n' "${HP_REFINER_VLLM_MAX_ACTIVE}" "${EDITOR_RESIDENT_CAP}" "${EDITOR_RAY_CAP}" "${EDITOR_DISPATCH_CAP}" "${EDITOR_SCHEDULER_CAP}" "${EDITOR_HTTP_CAP}"
+printf '[HP] editor scheduler DP=%s seqs/rank=%s batched_tokens/rank=%s partial_prefills=%s/%s; candidates/source=1 (global overlap comes from AgentLoop tasks, not candidate fanout)\n' "${HP_PEER_DATA_PARALLEL_SIZE}" "${HP_REFINER_MAX_NUM_SEQS}" "${HP_REFINER_MAX_BATCHED_TOKENS}" "${HP_REFINER_MAX_NUM_PARTIAL_PREFILLS}" "${HP_REFINER_MAX_LONG_PARTIAL_PREFILLS}"
+printf '[HP] PPO dynamic_batch=%s actor_token_cap/gpu=%s log_prob_token_cap/gpu=%s\n' "${HP_USE_DYNAMIC_BSZ}" "${HP_PPO_MAX_TOKEN_LEN_PER_GPU}" "${HP_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}"
+printf '[HP] Editor PPO actor_token_cap/gpu=%s log_prob_token_cap/gpu=%s\n' "${HP_EDITOR_PPO_MAX_TOKEN_LEN_PER_GPU}" "${HP_EDITOR_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}"
+printf '[HP] FSDP offload actor_param=%s actor_optimizer=%s ref_param=%s\n' "${HP_ACTOR_PARAM_OFFLOAD}" "${HP_ACTOR_OPTIMIZER_OFFLOAD}" "${HP_REF_PARAM_OFFLOAD}"
+printf '[HP] Editor FSDP offload actor_param=%s actor_optimizer=%s ref_param=%s\n' "${HP_EDITOR_ACTOR_PARAM_OFFLOAD}" "${HP_EDITOR_ACTOR_OPTIMIZER_OFFLOAD}" "${HP_EDITOR_REF_PARAM_OFFLOAD}"
+printf '[HP] no-result-reuse mode: prefix_cache=disabled dependency_prompt=declared_edges dag_workers/process=%s search_rounds=%s planner_tokens=%s\n' "${HP_DAG_AGENT_WORKERS_PER_PROCESS}" "${HP_BCP_SEARCH_ROUNDS:-1}" "${HP_BCP_SEARCH_PLANNER_MAX_TOKENS:-64}"
+# 0.92 was observed to exhaust 98,304-MiB cards during vLLM wake-up. The
+# defaults below preserve headroom while increasing throughput structurally.
+exec env \
+  DS_MAS_ROOT="${ROOT}" DS_VERL_ROOT="${ROOT}/verl" DS_ALL_GPUS="${GPU_DOMAIN}" \
+  DS_MAS_LOOP_PYTHON_MIRROR="${HP_MAS_LOOP_PYTHON_MIRROR:-}" \
+  DS_TIMESTAMP="${TS}" DS_TASK_JSON="${TASK_JSON}" \
+  DS_MODEL_PATH="${HP_MODEL_PATH:-/path/to/models/Qwen3-8B}" DS_ORCHESTRA_MODEL="${HP_ORCHESTRA_MODEL:-${HP_MODEL_PATH:-/path/to/models/Qwen3-8B}}" DS_EDITOR_MODEL="${HP_EDITOR_MODEL:-${HP_MODEL_PATH:-/path/to/models/Qwen3-8B}}" DS_SUBAGENT_MODEL="${HP_SUBAGENT_MODEL:-/path/to/models/Qwen3-30B-A3B}" \
+  DS_DATASET_NAME="${PROFILE_DATASET}" DS_RETRIEVER="${HP_RETRIEVER:-hotpotqa_bm25}" DS_BM25_INDEX="${HP_BM25_INDEX:-${ROOT}/datasets/BrowseComp-Plus/hotpotqa/indexes/bm25}" \
+  DS_RUN_DIR="${HP_RUN_DIR:-${RUN_ROOT}/train}" DS_CKPT_ROOT="${HP_CKPT_ROOT:-${RUN_ROOT}/train/checkpoints}" DS_DATA_DIR="${HP_DATA_DIR:-${RUN_ROOT}/train/data}" DS_LOG_DIR="${HP_LOG_DIR:-${RUN_ROOT}/train/logs}" DS_JUDGE_MODEL="${HP_JUDGE_MODEL}" \
+  DS_TRAIN_BATCH_SIZE="${TRAIN_BATCH}" DS_EDITOR_TRAIN_BATCH_SIZE="${EDITOR_BATCH}" \
+  DS_MAX_AGENT_TOKENS=8192 DS_EDITOR_MAX_TOKENS=8192 DS_JUDGE_MAX_TOKENS=4096 \
+  DS_PPO_MINI_BATCH_SIZE="${HP_PPO_MINI_BATCH_SIZE:-256}" DS_PPO_MICRO_BATCH_SIZE_PER_GPU="${HP_PPO_MICRO_BATCH_SIZE_PER_GPU:-8}" DS_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${HP_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-8}" \
+  DS_USE_DYNAMIC_BSZ="${HP_USE_DYNAMIC_BSZ}" DS_PPO_MAX_TOKEN_LEN_PER_GPU="${HP_PPO_MAX_TOKEN_LEN_PER_GPU}" DS_LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${HP_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}" \
+  DS_EDITOR_PPO_MAX_TOKEN_LEN_PER_GPU="${HP_EDITOR_PPO_MAX_TOKEN_LEN_PER_GPU}" DS_EDITOR_LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${HP_EDITOR_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}" \
+  DS_ACTOR_PARAM_OFFLOAD="${HP_ACTOR_PARAM_OFFLOAD}" DS_ACTOR_OPTIMIZER_OFFLOAD="${HP_ACTOR_OPTIMIZER_OFFLOAD}" DS_REF_PARAM_OFFLOAD="${HP_REF_PARAM_OFFLOAD}" \
+  DS_EDITOR_ACTOR_PARAM_OFFLOAD="${HP_EDITOR_ACTOR_PARAM_OFFLOAD}" DS_EDITOR_ACTOR_OPTIMIZER_OFFLOAD="${HP_EDITOR_ACTOR_OPTIMIZER_OFFLOAD}" DS_EDITOR_REF_PARAM_OFFLOAD="${HP_EDITOR_REF_PARAM_OFFLOAD}" \
+  DS_ROLLOUT_N="${ROLLOUT_N}" DS_EDITOR_CANDIDATES_PER_SOURCE=1 DS_EDITOR_GROUP_SIZE="${ROLLOUT_N}" \
+  DS_TOTAL_EPOCHS="${HP_TOTAL_EPOCHS:-1}" DS_ADVERSARIAL_ROUNDS="${HP_ADVERSARIAL_ROUNDS:-1}" DS_RUN_ORCHESTRA=1 DS_RUN_EDITOR="${RUN_EDITOR_OVERRIDE}" DS_PURE_ORCHESTRATOR_ABLATION="${PURE_ORCHESTRATOR_ABLATION}" \
+  DS_MAX_TRAIN_ROWS="${TRAIN_ROWS}" DS_DATA_SEED="${HP_DATA_SEED:-0}" DS_DATA_VAL_RATIO="${HP_DATA_VAL_RATIO:-0}" DS_DATA_PAD_TO_MULTIPLE="${DATA_PAD_TO_MULTIPLE}" DS_PREPARE_DATA_SHUFFLE="${PREPARE_DATA_SHUFFLE}" DS_TRAIN_DATA_SHUFFLE="${TRAIN_DATA_SHUFFLE}" DS_TRAIN_DROP_LAST="${TRAIN_DROP_LAST}" DS_PAD_EDITOR_REPLAY_TO_EXPECTED_ROWS="${PAD_EDITOR_REPLAY_TO_EXPECTED_ROWS}" \
+  DS_ORCH_LR="${HP_ORCH_LR}" DS_EDITOR_LR="${HP_REFINER_LR}" \
+  DS_SAVE_FREQ="${HP_SAVE_FREQ:-1}" DS_NUM_CHECKPOINTS="${NUM_CHECKPOINTS}" \
+  DS_ROLLOUT_GPU_MEM_UTIL="${HP_ROLLOUT_GPU_MEM_UTIL:-0.88}" DS_PEER_GPU_MEMORY_UTILIZATION="${HP_REFINER_GPU_MEMORY_UTILIZATION:-0.86}" DS_SUB_AGENT_GPU_MEMORY_UTILIZATION="${HP_SUBAGENT_GPU_MEMORY_UTILIZATION:-0.86}" \
+  PEER_TENSOR_PARALLEL_SIZE="${HP_PEER_TENSOR_PARALLEL_SIZE}" PEER_DATA_PARALLEL_SIZE="${HP_PEER_DATA_PARALLEL_SIZE}" SUB_AGENT_TENSOR_PARALLEL_SIZE="${HP_SUBAGENT_TENSOR_PARALLEL_SIZE}" SUB_AGENT_DATA_PARALLEL_SIZE="${HP_SUBAGENT_DATA_PARALLEL_SIZE}" JUDGE_TENSOR_PARALLEL_SIZE="${HP_JUDGE_TENSOR_PARALLEL_SIZE}" JUDGE_DATA_PARALLEL_SIZE="${HP_JUDGE_DATA_PARALLEL_SIZE}" \
+  DS_MAX_CONCURRENCY="${HP_MAX_CONCURRENCY:-2048}" DS_VLLM_MAX_ACTIVE="${HP_VLLM_MAX_ACTIVE:-2048}" \
+  DS_ORCHESTRA_VLLM_MAX_ACTIVE="${HP_ORCHESTRA_VLLM_MAX_ACTIVE:-1024}" DS_EDITOR_VLLM_MAX_ACTIVE="${HP_REFINER_VLLM_MAX_ACTIVE}" DS_SUB_AGENT_VLLM_MAX_ACTIVE="${HP_SUBAGENT_VLLM_MAX_ACTIVE:-1024}" \
+  DS_ROLLOUT_MAX_NUM_SEQS="${HP_ROLLOUT_MAX_NUM_SEQS:-1024}" DS_PEER_MAX_NUM_SEQS="${HP_REFINER_MAX_NUM_SEQS}" DS_SUB_AGENT_MAX_NUM_SEQS="${HP_SUBAGENT_MAX_NUM_SEQS:-128}" \
+  DS_ROLLOUT_MAX_NUM_BATCHED_TOKENS="${HP_ROLLOUT_MAX_BATCHED_TOKENS:-196608}" DS_PEER_MAX_NUM_BATCHED_TOKENS="${HP_REFINER_MAX_BATCHED_TOKENS}" DS_SUB_AGENT_MAX_NUM_BATCHED_TOKENS="${HP_SUBAGENT_MAX_BATCHED_TOKENS:-32768}" \
+  DS_PEER_MAX_NUM_PARTIAL_PREFILLS="${HP_REFINER_MAX_NUM_PARTIAL_PREFILLS}" DS_PEER_MAX_LONG_PARTIAL_PREFILLS="${HP_REFINER_MAX_LONG_PARTIAL_PREFILLS}" \
+  DS_JUDGE_GPU_MEMORY_UTILIZATION="${HP_JUDGE_GPU_MEMORY_UTILIZATION:-0.82}" DS_JUDGE_MAX_NUM_SEQS="${HP_JUDGE_MAX_NUM_SEQS:-64}" DS_JUDGE_MAX_NUM_BATCHED_TOKENS="${HP_JUDGE_MAX_BATCHED_TOKENS:-32768}" DS_JUDGE_MAX_MODEL_LEN="${HP_JUDGE_MAX_MODEL_LEN:-23192}" DS_JUDGE_VLLM_MAX_ACTIVE="${HP_JUDGE_VLLM_MAX_ACTIVE:-512}" DS_JUDGE_HTTP_POOL_MAXSIZE="${HP_JUDGE_HTTP_POOL_MAXSIZE:-512}" \
+  DS_RAY_SERVER_MAX_CONCURRENCY="${HP_RAY_SERVER_MAX_CONCURRENCY:-4096}" DS_RAY_GENERATE_MAX_OUTSTANDING="${HP_RAY_GENERATE_MAX_OUTSTANDING}" \
+  MAS_LOOP_AGENT_LOOP_WORKER_PROCESSES="${HP_AGENT_LOOP_WORKER_PROCESSES}" MAS_LOOP_AGENT_LOOP_MAX_OUTSTANDING_PER_WORKER="${HP_AGENT_LOOP_MAX_OUTSTANDING_PER_WORKER}" \
+  MAS_LOOP_DEPENDENCY_PROMPT_MODE=declared_edges MAS_LOOP_DAG_AGENT_PARALLEL=1 MAS_LOOP_DAG_AGENT_WORKERS_PER_PROCESS="${HP_DAG_AGENT_WORKERS_PER_PROCESS}" \
+  MAS_LOOP_BCP_RETRIEVAL_PROFILE=legacy MAS_LOOP_BCP_SEARCH_ROUNDS="${HP_BCP_SEARCH_ROUNDS:-1}" MAS_LOOP_BCP_SEARCH_PLANNER_MAX_TOKENS="${HP_BCP_SEARCH_PLANNER_MAX_TOKENS:-64}" \
+  DS_REWARD_NUM_WORKERS="${HP_REWARD_NUM_WORKERS:-64}" DS_EDITOR_CANDIDATE_CONCURRENCY="${HP_REFINER_CANDIDATE_CONCURRENCY}" DS_DISPATCH_WORKERS_PER_PROCESS="${HP_DISPATCH_WORKERS_PER_PROCESS}" \
+  DS_HTTP_NUM_POOLS="${HP_HTTP_NUM_POOLS:-256}" DS_HTTP_POOL_MAXSIZE="${HP_HTTP_POOL_MAXSIZE:-512}" DS_ORCHESTRA_HTTP_POOL_MAXSIZE="${HP_ORCHESTRA_HTTP_POOL_MAXSIZE:-512}" DS_EDITOR_HTTP_POOL_MAXSIZE="${HP_REFINER_HTTP_POOL_MAXSIZE}" DS_SUBAGENT_HTTP_POOL_MAXSIZE="${HP_SUBAGENT_HTTP_POOL_MAXSIZE:-512}" \
+  DS_VLLM_HTTP_BACKLOG="${HP_VLLM_HTTP_BACKLOG:-16384}" DS_PHASE_SOCKET_BACKLOG="${HP_PHASE_SOCKET_BACKLOG:-16384}" DS_VLLM_STARTUP_ATTEMPTS="${HP_VLLM_STARTUP_ATTEMPTS}" DS_PHASE_LEASE_GRACE_SEC="${HP_PHASE_LEASE_GRACE_SEC}" DS_VLLM_DP_QUIESCE_SEC="${HP_VLLM_DP_QUIESCE_SEC}" DS_EXTERNAL_VLLM_CPU_THREADS="${HP_EXTERNAL_VLLM_CPU_THREADS}" DS_RAY_WORKER_CPU_THREADS="${HP_RAY_WORKER_CPU_THREADS}" DS_EXTERNAL_VLLM_CPUSET="${HP_EXTERNAL_VLLM_CPUSET}" DS_EXTERNAL_VLLM_PORT_BASE="${HP_EXTERNAL_VLLM_PORT_BASE}" \
+  DS_ORCHESTRA_PORT="${ORCHESTRA_PORT}" DS_EDITOR_PORT="${EDITOR_PORT}" DS_SUBAGENT_PORT="${SUBAGENT_PORT}" DS_JUDGE_PORT="${JUDGE_PORT}" DS_RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT}" \
+  DS_RAY_TEMP_DIR="${RAY_TEMP_DIR}" DS_CONTROL_DIR="${CONTROL_DIR}" \
+  DS_ALFWORLD_DATA_ROOT="${HP_ALFWORLD_DATA_ROOT:-${ROOT}/../json_2.1.1}" DS_ALFWORLD_ACTIONS_PER_NODE="${HP_ALFWORLD_ACTIONS_PER_NODE:-4}" DS_ALFWORLD_MAX_RECOVERY_ROUNDS="${HP_ALFWORLD_MAX_RECOVERY_ROUNDS:-12}" \
+  DS_CONFIG_ONLY="${HP_CONFIG_ONLY:-0}" DS_SKIP_PREPARE_DATA="${SKIP_DATA_PREP:-0}" DS_USE_LLM_JUDGE="${HP_USE_LLM_JUDGE:-1}" DS_SHARE_SUBAGENT_JUDGE_VLLM="${HP_SHARE_SUBAGENT_JUDGE_VLLM}" DS_MAX_JOINT_STEPS_THIS_RUN="${HP_MAX_JOINT_STEPS_THIS_RUN}" \
+  bash "${ROOT}/verl/scripts/run_deepscaler_mas_loop_full.sh" "$@"

@@ -1,0 +1,88 @@
+experiment:
+  candidates: 16
+  sample_concurrency: 1
+generation:
+  temperature: 0.7
+  max_tokens: 2048
+mas:
+  planner_temperature: 0.7
+  planner_max_tokens: 8192
+  max_generation_attempts: 5
+  max_execution_attempts: 3
+retrieval:
+  hotpotqa:
+    backend: hotpotqa_lucene
+    index: /path/to/MAS_Loop/datasets/BrowseComp-Plus/hotpotqa/indexes/bm25
+    runtime_adapter: pyserini_lucene
+    allow_fts_smoke_fallback: true
+    rounds: 1
+    topk: 5
+    max_evidence_chars: 13500
+  bcp:
+    backend: controller_parquet
+    index: /path/to/MAS_Loop/datasets/BrowseComp-Plus/scripts_build_index/indexes/bm25
+    cache: /path/to/MAS_Loop/datasets/BrowseComp-Plus/.mas_loop_cache/controller_parquet_bm25
+    rounds: 5
+    topk: 5
+    max_evidence_chars: 13500
+endpoints:
+  generation:
+    base_url: ''
+    api_key: ''
+    model: /path/to/models/Qwen3-30B-A3B
+    tokenizer: /path/to/models/Qwen3-30B-A3B
+    timeout_s: 600
+    max_retries: 3
+  deepseek_v4_flash:
+    base_url: ''
+    api_key: ''
+    model: DeepSeek-V4-Flash
+    timeout_s: 600
+    max_retries: 3
+    requests_per_minute: 60
+  kimi_k3:
+    base_url: ''
+    api_key: ''
+    model: Kimi-K3
+    timeout_s: 600
+    max_retries: 3
+    requests_per_minute: 60
+  qwen3_8_2_4t_a95b:
+    base_url: ''
+    api_key: ''
+    model: Qwen3.8-2.4T-A95B
+    timeout_s: 600
+    max_retries: 3
+    requests_per_minute: 60
+judges:
+  max_tokens: 1024
+  concurrency: 16
+reward_models:
+  skywork_v2_qwen3_8b:
+    base_model: /path/to/models/Skywork-Reward-V2-Qwen3-8B
+    adapter: null
+    max_length: 8192
+    batch_size: 2
+  orch_rm:
+    base_model: /path/to/models/Skywork-Reward-V2-Qwen3-8B
+    adapter: /path/to/checkpoints/reward_models/hotpotqa_task25/baseline_orchrm_orchestration/final
+    max_length: 8192
+    batch_size: 2
+  mas_judgerm_orchestration:
+    base_model: /path/to/models/Skywork-Reward-V2-Qwen3-8B
+    adapter: /path/to/checkpoints/reward_models/hotpotqa_task25/orchestration_level/final
+    max_length: 8192
+    batch_size: 2
+  mas_judgerm_trajectory:
+    base_model: /path/to/models/Skywork-Reward-V2-Qwen3-8B
+    adapter: /path/to/checkpoints/reward_models/hotpotqa_task25/trajectory_level/final
+    max_length: 8192
+    batch_size: 2
+token_policy:
+  generative_calls: Prefer OpenAI-compatible API usage; otherwise tokenizer estimate,
+    explicitly labeled.
+  reward_models: Exact non-padding sequence-classification input tokens; output tokens
+    are zero.
+  candidate_reuse: Each selector is charged the complete candidate bank it logically
+    requires, even when physical calls are cached.
+  evaluation: Deterministic normalized answer matching; no evaluation-judge tokens.
