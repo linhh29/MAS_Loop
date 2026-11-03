@@ -1,10 +1,15 @@
+# MAS-Loop: Beyond One-Shot Orchestration towards Self-Evolving Multi-Agent Systems
+
 <div align="center">
 
+### Construct → Execute → Diagnose & Refine → Re-execute
 
-# MAS-Loop
+[![Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2610.38946)
+[![Code](https://img.shields.io/badge/Code-GitHub-181717?logo=github&logoColor=white)](https://github.com/linhh29/MAS_Loop)
+[![Project Blog](https://img.shields.io/badge/Blog-Project%20Page-0078D4?logo=readthedocs&logoColor=white)](https://linhh29.github.io/blog/MAS-Loop/index.html)
+[![Online Demo](https://img.shields.io/badge/Demo-Online%20Demo-512BD4?logo=rocket&logoColor=white)](https://mas-loop-demo.hehailin.life/)
 
-### Iterative Construction, Execution, and Optimization of Multi-Agent Systems
-
+Execution-grounded feedback connects system construction, trajectory diagnosis, and independent re-execution.
 
 </div>
 
